@@ -1,0 +1,1 @@
+# Quantum-Reservoir-Computing-Utilizing-Quantum-Chaotic-Systems-with-Heisenberg-XXZ-Spin-Chains
