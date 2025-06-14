@@ -1,0 +1,299 @@
+# Module 1: Imports and Class Definitions
+# Imports
+import cupy as cp
+import matplotlib.pyplot as plt
+import queue
+import random
+import threading
+import time
+from quspin.basis import spin_basis_1d
+from quspin.operators import hamiltonian
+from scipy.linalg import eigh
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import classification_report, confusion_matrix, f1_score
+from sklearn.model_selection import KFold
+from sklearn.preprocessing import LabelEncoder
+
+
+# Define QuantumSystem class
+class QuantumSystem:
+    def __init__(self, N, J, Delta, lambda_field, tau, hbar, theta):
+        self.N = N                    # Number of qubits
+        self.J = J                    # Exchange interaction constant
+        self.Delta = Delta            # Anisotropy parameter in z-direction
+        self.J_zz = J * Delta         # Exchange interaction constant in z direction
+        self.lambda_field = lambda_field  # Perturbing magnetic field to central spin
+        self.tau = tau                # How long to let time evolve
+        self.hbar = hbar              # Dirac constant
+        self.theta = theta            # Encoding angle
+        self.initial_state = self.prepare_initial_state()  # Initial state
+        self.U_cache = None           # Cache matrix for time evolution
+        self.H_matrix = None          # Matrix representing the Hamiltonian
+
+    # Prepare N qubits with initial state |+i>
+    def prepare_initial_state(self):
+        state = cp.array([1, 1j]) / cp.sqrt(2)
+        for _ in range(self.N - 1):
+            state = cp.kron(state, cp.array([1, 1j]) / cp.sqrt(2))
+        return state / cp.linalg.norm(state)
+
+    # Prepare a cache matrix for time evolution
+    def prepare_U_cache(self, H_matrix):
+        self.H_matrix = H_matrix
+        eigenvalues, eigenvectors = eigh(H_matrix)
+        eigenvalues = cp.asarray(eigenvalues)
+        eigenvectors = cp.asarray(eigenvectors)
+        self.U_cache = (
+            eigenvectors
+            @ cp.diag(cp.exp(-1j * eigenvalues * self.tau / self.hbar))
+            @ eigenvectors.conj().T
+        )
+
+    # Define an array to calculate the output of each quantum bit at each time
+    def calculate_output_array(self, bit_sequence_matrix, weights_matrix):
+        if bit_sequence_matrix.ndim == 1:
+            bit_sequence_matrix = bit_sequence_matrix[None, :]
+        T, N_dim = bit_sequence_matrix.shape
+        output = cp.zeros((T, self.N))
+        for t in range(T):
+            inputs_at_t = bit_sequence_matrix[t, :]  # Retrieve sequence data at time t
+            current_state = self.U_cache @ self.initial_state  # Time evolution of the initial state
+
+            # # Encode classical inputs with Rz rotation gate (When N=6)
+            # Rz_full = None
+            # for n in range(self.N):
+            #     angle = self.theta * inputs_at_t[n]
+            #     Rz = cp.array([[cp.exp(-1j * angle / 2).get(), 0], [0, cp.exp(1j * angle / 2).get()]])
+            #     Rz_full = Rz if Rz_full is None else cp.kron(Rz_full, Rz)
+            # current_state = Rz_full @ current_state
+
+            # Encode classical inputs with Rz rotation gate (When N=11)
+            Rz_full = None
+            for n in range(self.N):
+                # Encode only to odd-numbered qubits
+                if n % 2 == 0:
+                    angle = self.theta * inputs_at_t[n // 2]
+                # The even-numbered qubits remain unchanged
+                else:
+                    angle = 0
+                Rz = cp.array([[cp.exp(-1j * angle / 2).get(), 0], [0, cp.exp(1j * angle / 2).get()]])
+                Rz_full = Rz if Rz_full is None else cp.kron(Rz_full, Rz)
+            current_state = Rz_full @ current_state
+
+            # Measure each qubit in X basis
+            for l in range(self.N):
+                M_operator = None  # Initialize the measurement operator
+                # Construct the measurement operator for l-th qubit
+                for m in range(self.N):
+                    if l == m:
+                        operator = cp.array([[0, 1], [1, 0]])  # Pauli X matrix for l-th qubit
+                    else:
+                        operator = cp.eye(2)  # Identity matrix for other qubits
+                    M_operator = operator if M_operator is None else cp.kron(M_operator, operator)
+                # Perform the measurement
+                measurement = cp.abs(current_state.conj().T @ M_operator @ current_state) ** 2
+                output[t, l] = measurement
+        return output @ weights_matrix.T
+
+
+# Function to plot data
+def plot_time_series(data, labels, title):
+    unique_labels = set(labels)
+    fig, axes = plt.subplots(len(unique_labels), 1, figsize=(10, 6), sharex=True)
+    fig.suptitle(title)
+    for ax, label in zip(axes, unique_labels):
+        for sequence in data:
+            if labels[data.index(sequence)] == label:
+                ax.plot(sequence, label=label)
+                break
+        ax.set_title(f"Label: {label}")
+        ax.set_xlabel("Time Step")
+        ax.set_ylabel("Values")
+    plt.tight_layout()
+    plt.show()
+
+
+# Module 2: Define Functions for Preparing Data, k-Cross-Validation and Plotting
+
+# Function to load and normalize data
+def load_and_normalize_data(file_path):
+    with open(file_path, "r") as file:
+        data = file.readlines()
+    labels = []
+    sequences = []
+    for i in range(0, len(data), 18):
+        label = data[i].strip()
+        if label:
+            sequence = [list(map(int, line.strip().split("\t"))) for line in data[i + 1 : i + 16]]
+            labels.append(label)
+            sequences.append(sequence)
+    sequences = cp.array(sequences)  # Convert sequence from list to CyPy array
+    return sequences, labels
+
+
+# Transform sequence data by quantum reservoir
+def transform_data_with_quantum_reservoir(quantum_system, data):
+    transformed_data = []
+    for sequence in data:
+        output_array = quantum_system.calculate_output_array(cp.array(sequence), cp.eye(quantum_system.N))
+        transformed_data.append(output_array.ravel())
+    return cp.array(transformed_data)
+
+
+# Define k-cross-validation to obtain average accuracy
+def perform_k_fold_cross_validation(quantum_system, data, labels, k=3):
+    kf = KFold(n_splits=k, shuffle=True)
+    accuracies = []
+    # Perform logistic regression for each fold to obtain accuracy
+    for train_index, test_index in kf.split(data):
+        train_data, test_data = data[train_index], data[test_index]
+        train_labels, test_labels = labels[train_index], labels[test_index]
+        # Transform data by quantum reservoir
+        transformed_train_data = transform_data_with_quantum_reservoir(quantum_system, train_data)
+        transformed_test_data = transform_data_with_quantum_reservoir(quantum_system, test_data)
+        # Convert string labels to numeric values
+        label_encoder = LabelEncoder()
+        train_labels_encoded = label_encoder.fit_transform(train_labels)
+        test_labels_encoded = label_encoder.transform(test_labels)
+        # Perform logistic regression to obtain accuracy
+        model = LogisticRegression(max_iter=1000)
+        model.fit(transformed_train_data.get(), train_labels_encoded)
+        accuracy = model.score(transformed_test_data.get(), test_labels_encoded)
+        accuracies.append(accuracy)
+        break  ##
+
+    # Calculate the average accuracy from the accuracy of each fold
+    average_accuracy = sum(accuracies) / len(accuracies)
+    # print(f"Average accuracy is {average_accuracy}")
+    return average_accuracy
+
+
+# Hamiltonian of a Heisenberg XXZ spin chain with central spin field perturbation
+def prepare_Hamiltonian(lambda_field):
+    basis = spin_basis_1d(N, pauli=False)
+    operators = [
+        ["xx", [[J, i, i + 1] for i in range(N - 1)]],
+        ["yy", [[J, i, i + 1] for i in range(N - 1)]],
+        ["zz", [[J * Delta, i, i + 1] for i in range(N - 1)]],
+    ]
+    ope_field = [["z", [[1, (N + 1) // 2]]]]
+    # Hamiltonian of the Heisenberg XXZ spin chain
+    H_XXZ_0 = hamiltonian(operators, [], basis=basis, dtype=cp.float64, check_symm=False, check_herm=False)
+    # Hamiltonian of magnetic field perturbations to the central spin
+    H_XXZ_1 = hamiltonian(ope_field, [], basis=basis, dtype=cp.float64, check_symm=False, check_herm=False)
+    # Hamiltonian of the whole system
+    H_XXZ = H_XXZ_0 + lambda_field * H_XXZ_1
+    H_matrix = H_XXZ.toarray()
+    return H_matrix
+
+
+# Process for calculating accuracy using grid search
+def process_grid(q, i, j, lambda_field, tau, data, labels):
+    # Prepare a quantum system with set parameters
+    quantum_system = QuantumSystem(N, J, Delta, lambda_field, tau, hbar, theta)
+    # Prepare a matrix of Hamiltonian for the whole system
+    H_matrix = prepare_Hamiltonian(lambda_field)
+    # Prepare U_cache for time evolution
+    quantum_system.prepare_U_cache(H_matrix)
+    # Perform k-fold cross-validation
+    accuracy = perform_k_fold_cross_validation(quantum_system, data, labels, k=3)
+    q.put([i, j, accuracy])
+
+
+# Define grid search with lambda_field and tau as hyperparameters
+def grid_search(data, labels, lambda_values, tau_values):
+    accuracies = cp.zeros((len(lambda_values), len(tau_values)))
+    q = queue.SimpleQueue()
+    procs = []
+    for i, lambda_field in enumerate(lambda_values):
+        for j, tau in enumerate(tau_values):
+            # print(f"Setting lambda_field to {lambda_field} and tau to {tau}")
+            proc = threading.Thread(
+                target=process_grid,
+                args=(q, i, j, lambda_field.item(), tau.item(), data, labels),
+            )
+            proc.start()
+            procs.append(proc)
+            if len(procs) >= 36 or (lambda_field == last_lambda_value and tau == last_tau_value):
+                for procs_proc in procs:
+                    procs_proc.join()  # Main*1, Sub*4, Main is waiting
+                    acc_i, acc_j, accuracy = q.get()
+                    accuracies[acc_i, acc_j] = accuracy
+                procs.clear()
+    return accuracies
+
+
+# Define a function to plot accuracy heatmap by lambda_field and tau
+def plot_accuracy_heatmap(accuracies, lambda_values, tau_values):
+    plt.figure(figsize=(10, 8))
+    plt.imshow(
+        accuracies,
+        interpolation="nearest",
+        cmap="viridis",
+        aspect="auto",
+        extent=[tau_values[0], tau_values[-1], lambda_values[0], lambda_values[-1]],
+    )
+    plt.colorbar(label="Accuracy")
+    plt.xlabel("Tau")
+    plt.ylabel("Lambda Field")
+    plt.title("Accuracy Heatmap for Lambda Field and Tau")
+    plt.show()
+
+
+# Function to display top and bottom 10 accuracies with their corresponding lambda and tau
+def display_accuracies(accuracies, lambda_values, tau_values, top_n=10):
+    flat_accuracies = accuracies.ravel()
+    # Get the indices of the top and bottom 10 accuracies
+    top_indices = cp.argsort(flat_accuracies)[-top_n:][::-1]
+    bottom_indices = cp.argsort(flat_accuracies)[:top_n]
+    # Top 10 accuracies with their corresponding lambda and tau
+    print("\nTop accuracies 10 and their corresponding lambda and tau values:")
+    for index in top_indices:
+        i, j = cp.unravel_index(index, accuracies.shape)
+        print(f"Accuracy: {accuracies[i, j]:.3f}, Lambda: {lambda_values[i]}, Tau: {tau_values[j]}")
+    # Bottom 10 accuracies with their corresponding lambda and tau
+    print("\nBottom 10 accuracies and their corresponding lambda and tau values:")
+    for index in bottom_indices:
+        i, j = cp.unravel_index(index, accuracies.shape)
+        print(f"Accuracy: {accuracies[i, j]:.3f}, Lambda: {lambda_values[i]}, Tau: {tau_values[j]}")
+
+
+# Module 3: Parameter Setting
+N = 11  # Number of qubits
+J = 1.0  # Exchange interaction constant
+Delta = 0.5  # Anisotropy parameter in z-direction
+hbar = 1  # Dirac constant
+theta = cp.pi / 90  # Encoding angle
+last_lambda_value = 10  # Last lambda_field value
+last_tau_value = 10  # Last tau value
+
+
+# Module 4: Main execution workflow
+start_time = time.time()
+# Print the time when this program was started to run
+now = time.ctime()
+cnvtime = time.strptime(now)
+print(time.strftime("%Y/%m/%d %H:%M", cnvtime))
+
+# Load and normalize data
+file_path = "dataset/robot+execution+failures/lp5.data"
+sequences, labels = load_and_normalize_data(file_path)
+
+# Encode labels with class names
+label_encoder = LabelEncoder()
+labels_encoded = label_encoder.fit_transform(labels)
+
+# Set ranges of lambda_field and tau for grid search
+lambda_values = cp.linspace(0, last_lambda_value, 20)
+tau_values = cp.linspace(0, last_tau_value, 20)
+
+# Perform grid search and get the accuracy matrix
+accuracies = grid_search(sequences, labels_encoded, lambda_values, tau_values)
+
+# Display top and bottom 10 accuracies
+display_accuracies(accuracies, lambda_values, tau_values, top_n=10)
+
+# Plot the accuracy heatmap by lambda_field and tau
+plot_accuracy_heatmap(accuracies.get(), lambda_values.get(), tau_values.get())
+
+print(f"Time elapsed: {time.time() - start_time:.2f} seconds")
