@@ -1,0 +1,131 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from quspin.operators import hamiltonian
+from quspin.basis import spin_basis_1d
+from scipy.stats import entropy
+import pandas as pd
+
+
+def plot_dist(N: int, Jxy: float, Jzz: float,
+              perturbation_type: str, lmbda: float):
+    """
+    Return the normalized nearest-neighbor level spacings for a given spin chain.
+
+    Parameters
+    ----------
+    N : int
+        Number of lattice sites in the spin chain.
+    Jxy : float
+        XY-plane coupling constant.
+    Jzz : float
+        Z-axis coupling constant.
+    perturbation_type : {"field", "next_nearest"}
+        Type of perturbation to apply.
+    lmbda : float
+        Perturbation strength.
+
+    Returns
+    -------
+    np.ndarray
+        Sorted, normalized level spacings with 0 < s < 5.
+    """
+    # Nearest-neighbor interactions
+    J_zz = [[Jzz, i, i + 1] for i in range(N - 1)]
+    J_pm = [[Jxy / 2, i, i + 1] for i in range(N - 1)]
+
+    no_checks = dict(check_herm=False, check_pcon=False, check_symm=False)
+
+    # Basis with total magnetization 0 and parity +1
+    basis = spin_basis_1d(N, pauli=False, Nup=N // 2, pblock=1)
+
+    static, dynamic = [], []
+
+    if perturbation_type == "field":
+        # Local magnetic field at the central site
+        middle_spin = (N - 1) // 2
+        h_z = [[lmbda, middle_spin]]
+        static = [["+-", J_pm], ["-+", J_pm], ["zz", J_zz], ["z", h_z]]
+
+    elif perturbation_type == "next_nearest":
+        # Next-nearest-neighbor Ising interactions
+        J_zz_nn = [[lmbda * Jxy, i, i + 2] for i in range(N - 2)]
+        static = [["+-", J_pm], ["-+", J_pm],
+                  ["zz", J_zz], ["zz", J_zz_nn]]
+
+    else:
+        raise ValueError(f"Unknown perturbation_type: {perturbation_type}")
+
+    # Build Hamiltonian and diagonalize
+    H = hamiltonian(static, dynamic, basis=basis,
+                    dtype=np.float64, **no_checks)
+    E, _ = H.eigh()
+
+    # Energy window filter
+    E = E[np.abs(E) < 1.7]
+
+    # Positive spacings, normalized by their mean
+    delta_E = np.diff(np.sort(E))
+    delta_E = delta_E[delta_E > 0]
+    s = np.sort(delta_E / np.mean(delta_E))
+
+    return s[s < 5]
+
+
+def calculate_KL_divergence(s: np.ndarray,
+                            bin_edges: np.ndarray,
+                            P_poiss: np.ndarray,
+                            P_GOE: np.ndarray):
+    """
+    Compute KL divergence between the empirical spacing distribution and
+    Poisson/GOE reference distributions.
+    """
+    P_s, _ = np.histogram(s, bins=bin_edges, density=True)
+    KL_poisson = entropy(P_s, P_poiss)
+    KL_goe = entropy(P_s, P_GOE)
+    return KL_poisson, KL_goe
+
+
+# Histogram settings
+BIN_EDGES = np.linspace(0, 5, 51)
+BIN_CENTERS = (BIN_EDGES[:-1] + BIN_EDGES[1:]) / 2
+
+# Reference distributions
+P_POISSON = np.exp(-BIN_CENTERS)
+P_GOE = (np.pi / 2) * BIN_CENTERS * np.exp(-np.pi * BIN_CENTERS**2 / 4)
+
+
+def generate_data_and_plot():
+    lambda_values = [0.01, 0.05, 0.10, 0.15, 0.20, 0.25, 0.30]
+    KL_divergences = []
+
+    fig, ax = plt.subplots(figsize=(8, 6))
+    ax.plot(BIN_CENTERS, P_POISSON, "--", label="Poisson")
+    ax.plot(BIN_CENTERS, P_GOE, "-.", label="GOE")
+
+    for lmbda in lambda_values:
+        # Compute level spacings
+        s = plot_dist(N=15, Jxy=1.0, Jzz=0.5,
+                      perturbation_type="field", lmbda=lmbda)
+
+        # Plot histogram
+        ax.hist(s, bins=BIN_EDGES, density=True, alpha=0.5,
+                label=f"λ = {lmbda}")
+
+        # KL divergence
+        KL_P, KL_G = calculate_KL_divergence(s, BIN_EDGES,
+                                             P_POISSON, P_GOE)
+        KL_divergences.append((lmbda, KL_P, KL_G))
+
+    ax.set_xlabel("Normalised spacing $s$")
+    ax.set_ylabel("$P(s)$")
+    ax.legend()
+    plt.tight_layout()
+    plt.show()
+
+    df = pd.DataFrame(KL_divergences,
+                      columns=["lambda", "KL_Poisson", "KL_GOE"])
+    print(df.to_string(index=False))
+
+
+if __name__ == "__main__":
+    generate_data_and_plot()
