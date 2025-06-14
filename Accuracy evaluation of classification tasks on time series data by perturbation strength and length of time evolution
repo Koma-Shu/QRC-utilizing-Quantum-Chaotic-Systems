@@ -113,6 +113,7 @@ def plot_time_series(data, labels, title):
     plt.show()
 
 
+
 # Module 2: Define Functions for Preparing Data, k-Cross-Validation and Plotting
 
 # Function to load and normalize data
@@ -258,6 +259,7 @@ def display_accuracies(accuracies, lambda_values, tau_values, top_n=10):
         print(f"Accuracy: {accuracies[i, j]:.3f}, Lambda: {lambda_values[i]}, Tau: {tau_values[j]}")
 
 
+
 # Module 3: Parameter Setting
 N = 11  # Number of qubits
 J = 1.0  # Exchange interaction constant
@@ -266,6 +268,7 @@ hbar = 1  # Dirac constant
 theta = cp.pi / 90  # Encoding angle
 last_lambda_value = 10  # Last lambda_field value
 last_tau_value = 10  # Last tau value
+
 
 
 # Module 4: Main execution workflow
